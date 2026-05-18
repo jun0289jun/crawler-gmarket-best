@@ -25,10 +25,15 @@ def as_bool(value: str, default: bool = True) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def latest_csv_from_output_dir() -> Path:
-    files = sorted(Path("output").glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+def latest_file_from_output_dir() -> Path:
+    """ZIP이 있으면 ZIP을, 없으면 최신 CSV를 반환."""
+    output_dir = Path("output")
+    zips = sorted(output_dir.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if zips:
+        return zips[0]
+    files = sorted(output_dir.glob("**/*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
-        raise FileNotFoundError("output 디렉터리에서 CSV 파일을 찾지 못했습니다.")
+        raise FileNotFoundError("output 디렉터리에서 ZIP 또는 CSV 파일을 찾지 못했습니다.")
     return files[0]
 
 
@@ -44,9 +49,10 @@ def build_message(attachment_path: Path) -> EmailMessage:
     message["Subject"] = subject
     message.set_content(
         "안녕하세요.\n\n"
-        "GitHub Actions에서 실행한 G마켓 베스트 1~200위 크롤링 결과 CSV를 첨부합니다.\n\n"
+        "GitHub Actions에서 실행한 G마켓 베스트 전 카테고리(47개) 크롤링 결과를 첨부합니다.\n\n"
         f"첨부 파일: {attachment_path.name}\n"
         f"생성 시각: {datetime.now():%Y-%m-%d %H:%M:%S}\n\n"
+        "※ ZIP 파일 내 카테고리별 CSV와 전체 합본 CSV(ALL)가 포함되어 있습니다.\n\n"
         "이 메일은 자동 발송되었습니다."
     )
 
@@ -91,7 +97,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    attachment_path = Path(args.file) if args.file else latest_csv_from_output_dir()
+    attachment_path = Path(args.file) if args.file else latest_file_from_output_dir()
     if not attachment_path.exists():
         raise FileNotFoundError(f"첨부 파일을 찾을 수 없습니다: {attachment_path}")
 
