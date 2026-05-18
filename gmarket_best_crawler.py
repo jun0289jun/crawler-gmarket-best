@@ -6,6 +6,9 @@ import json
 import os
 import random
 import re
+import shutil
+import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,6 +22,59 @@ from playwright.sync_api import sync_playwright
 BEST_URL = "https://www.gmarket.co.kr/n/best"
 DEFAULT_OUT_DIR = Path("output")
 DEFAULT_MAX_ITEMS = 200
+
+# 크롤링 대상 카테고리 목록 (대분류, 소분류, groupCode, subGroupCode)
+CATEGORIES: list[tuple[str, str, str, str]] = [
+    ("가공식품", "냉동/간편조리식품",  "100000005", "200000036"),
+    ("가공식품", "건강/다이어트식품",  "100000005", "200000037"),
+    ("가공식품", "과자/간식",         "100000005", "200000034"),
+    ("가공식품", "커피/음료/생수",     "100000005", "200000038"),
+    ("가공식품", "캔/오일/조미료",     "100000005", "200000035"),
+    ("생필품/육아", "화장지/물티슈",      "100000007", "200000045"),
+    ("생필품/육아", "세제/일회용품",      "100000007", "200001001"),
+    ("생필품/육아", "구강/위생용품",      "100000007", "200001003"),
+    ("생필품/육아", "기저귀/분유/이유식", "100000007", "200006002"),
+    ("생필품/육아", "유아동의류/잡화",    "100000007", "200006003"),
+    ("생필품/육아", "출산/유아용품",      "100000007", "200006004"),
+    ("생필품/육아", "장난감/완구",        "100000007", "200006005"),
+    ("생활/주방", "주방용품",          "100001001", "200001012"),
+    ("생활/주방", "쿡웨어/식기/용기",   "100001001", "200001009"),
+    ("생활/주방", "생활잡화/보안/수납", "100001001", "200001007"),
+    ("생활/주방", "욕실/청소",         "100001001", "200001006"),
+    ("생활/주방", "자동차용품",        "100001001", "200006006"),
+    ("생활/주방", "공구",             "100001001", "200006007"),
+    ("생활/주방", "안전/산업용품",     "100001001", "200006008"),
+    ("패션/잡화", "여성의류",       "100000001", "200000004"),
+    ("패션/잡화", "남성의류",       "100000001", "200000005"),
+    ("패션/잡화", "언더웨어",       "100000001", "200000006"),
+    ("패션/잡화", "캐주얼의류",     "100000001", "200013001"),
+    ("패션/잡화", "브랜드잡화/명품", "100000001", "200003001"),
+    ("패션/잡화", "신발",          "100000001", "200003003"),
+    ("패션/잡화", "가방/잡화",     "100000001", "200003002"),
+    ("패션/잡화", "액세서리",      "100000001", "200006001"),
+    ("뷰티", "스킨케어",          "100000003", "200000017"),
+    ("뷰티", "바디/헤어케어",      "100000003", "200014001"),
+    ("뷰티", "메이크업",          "100000003", "200000019"),
+    ("뷰티", "클렌징/팩/미용소품", "100000003", "200003008"),
+    ("뷰티", "남성화장품",        "100000003", "200000023"),
+    ("가구/홈", "가구/DIY",     "100001004", "200003010"),
+    ("가구/홈", "침구/홈",      "100001004", "200006015"),
+    ("가구/홈", "인테리어/소품", "100001004", "200001025"),
+    ("스포츠/건강", "마스크/의료",       "100001002", "200006009"),
+    ("스포츠/건강", "안마/정수기/비데",   "100001002", "200006010"),
+    ("스포츠/건강", "스포츠의류/운동화",  "100001002", "200006011"),
+    ("스포츠/건강", "등산/아웃도어",     "100001002", "200006012"),
+    ("스포츠/건강", "캠핑/낚시",        "100001002", "200006013"),
+    ("스포츠/건강", "구기/라켓/수영",    "100001002", "200006014"),
+    ("스포츠/건강", "골프/자전거",       "100001002", "200007001"),
+    ("스포츠/건강", "렌탈 서비스",       "100001002", "200015001"),
+    ("취미/문구/펫", "악기/취미",    "100001003", "200001018"),
+    ("취미/문구/펫", "꽃/이벤트용품", "100001003", "200001020"),
+    ("취미/문구/펫", "문구/사무용품", "100001003", "200001021"),
+    ("취미/문구/펫", "반려동물",     "100001003", "200001022"),
+]
+
+CATEGORY_CRAWL_DELAY_SEC = 3  # 카테고리 간 요청 딜레이 (봇 차단 방지)
 
 RED_PRICE_RGB = "rgb(218, 18, 13)"  # #DA120D
 BLACK_PRICE_RGB = "rgb(66, 66, 66)"  # #424242
@@ -521,85 +577,168 @@ def parse_products(html: str, max_items: int) -> list[dict[str, str]]:
     return rows[:max_items]
 
 
-def write_csv(rows: list[dict[str, str]], output_path: Path) -> None:
+CSV_FIELDNAMES = [
+    "category_main",
+    "category_sub",
+    "rank",
+    "product_name",
+    "final_price_krw",
+    "sale_price_krw",
+    "coupon_applied_price_krw",
+    "original_price_krw",
+    "discount_rate_percent",
+    "payment_benefit_info",
+    "shipping_info",
+    "fulfillment_info",
+    "arrival_info",
+    "review_count",
+    "avg_star_point",
+    "seller_name",
+    "goodscode",
+    "product_url",
+    "image_url",
+    "final_price_extraction_note",
+    "raw_text",
+]
+
+
+def write_csv(rows: list[dict[str, str]], output_path: Path, append: bool = False) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "rank",
-        "product_name",
-        "final_price_krw",
-        "sale_price_krw",
-        "coupon_applied_price_krw",
-        "original_price_krw",
-        "discount_rate_percent",
-        "payment_benefit_info",
-        "shipping_info",
-        "fulfillment_info",
-        "arrival_info",
-        "review_count",
-        "avg_star_point",
-        "seller_name",
-        "goodscode",
-        "product_url",
-        "image_url",
-        "final_price_extraction_note",
-        "raw_text",
-    ]
-    with output_path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+    mode = "a" if append else "w"
+    write_header = not append or not output_path.exists()
+    with output_path.open(mode, newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
         writer.writerows(rows)
 
 
+def crawl_one(
+    url: str,
+    max_items: int,
+    timeout_ms: int,
+    request_timeout_sec: int,
+    mode: str,
+    headed: bool,
+    browser_executable_path: str,
+) -> str:
+    """단일 URL을 크롤링해 HTML 반환. 실패 시 예외를 그대로 raise."""
+    html = ""
+    if mode in ["auto", "requests"]:
+        try:
+            html = fetch_static_html(url, request_timeout_sec)
+            print("  fetch_method=requests")
+        except Exception as exc:
+            if mode == "requests":
+                raise
+            print(f"  fetch_method=requests_failed reason={type(exc).__name__}: {exc}")
+
+    if not html:
+        html = fetch_rendered_html(
+            url,
+            max_items,
+            timeout_ms,
+            headless=not headed,
+            browser_executable_path=browser_executable_path,
+        )
+        print("  fetch_method=browser")
+    return html
+
+
+def zip_output_dir(dir_path: Path, zip_path: Path) -> None:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for csv_file in sorted(dir_path.glob("*.csv")):
+            zf.write(csv_file, csv_file.name)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="G마켓 베스트 1~200위 상품을 크롤링해 CSV로 저장합니다.")
-    parser.add_argument("--url", default=BEST_URL, help="크롤링할 G마켓 베스트 URL")
-    parser.add_argument("--max-items", type=int, default=DEFAULT_MAX_ITEMS, help="수집할 최대 상품 수")
-    parser.add_argument("--output", default="", help="CSV 출력 경로. 미지정 시 output/gmarket_best_YYYYMMDD_HHMMSS.csv")
+    parser = argparse.ArgumentParser(description="G마켓 베스트 전 카테고리 상품을 크롤링해 CSV로 저장합니다.")
+    parser.add_argument("--max-items", type=int, default=DEFAULT_MAX_ITEMS, help="카테고리당 수집할 최대 상품 수")
+    parser.add_argument("--output-dir", default="", help="출력 디렉터리. 미지정 시 output/YYYYMMDD/")
     parser.add_argument("--timeout-ms", type=int, default=60000, help="페이지 로딩 타임아웃(ms)")
     parser.add_argument("--request-timeout-sec", type=int, default=30, help="requests SSR 시도 타임아웃(초)")
-    parser.add_argument("--mode", choices=["auto", "requests", "browser"], default="auto", help="수집 방식: auto는 requests를 먼저 시도한 뒤 브라우저로 fallback")
-    parser.add_argument("--headed", action="store_true", help="가상 디스플레이 등에서 headed 브라우저로 실행")
+    parser.add_argument("--mode", choices=["auto", "requests", "browser"], default="auto", help="수집 방식")
+    parser.add_argument("--headed", action="store_true", help="headed 브라우저로 실행")
+    parser.add_argument("--delay-sec", type=float, default=CATEGORY_CRAWL_DELAY_SEC, help="카테고리 간 딜레이(초)")
     parser.add_argument(
         "--browser-executable-path",
         default=os.getenv("BROWSER_EXECUTABLE_PATH", ""),
-        help="시스템 Chrome/Chromium 실행 파일 경로. 미지정 시 Playwright 번들 Chromium 사용",
+        help="시스템 Chrome/Chromium 실행 파일 경로",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    output_path = Path(args.output) if args.output else DEFAULT_OUT_DIR / f"gmarket_best_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    date_str = datetime.now().strftime("%Y%m%d")
+    out_dir = Path(args.output_dir) if args.output_dir else DEFAULT_OUT_DIR / date_str
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    html = ""
-    if args.mode in ["auto", "requests"]:
+    combined_path = out_dir / f"gmarket_best_ALL_{date_str}.csv"
+    summary: list[dict[str, str]] = []
+    failed_categories: list[str] = []
+
+    total = len(CATEGORIES)
+    for idx, (cat_main, cat_sub, group_code, sub_group_code) in enumerate(CATEGORIES, start=1):
+        url = f"{BEST_URL}?groupCode={group_code}&subGroupCode={sub_group_code}"
+        safe_name = cat_sub.replace("/", "_")
+        cat_csv = out_dir / f"{cat_main}_{safe_name}.csv"
+
+        print(f"\n[{idx}/{total}] {cat_main} > {cat_sub}")
+        print(f"  url={url}")
+
         try:
-            html = fetch_static_html(args.url, args.request_timeout_sec)
-            print("fetch_method=requests")
+            html = crawl_one(
+                url,
+                args.max_items,
+                args.timeout_ms,
+                args.request_timeout_sec,
+                args.mode,
+                args.headed,
+                args.browser_executable_path,
+            )
+            rows = parse_products(html, args.max_items)
+            if not rows:
+                raise RuntimeError("수집된 상품이 없습니다.")
+
+            # 카테고리 컬럼 추가
+            for row in rows:
+                row["category_main"] = cat_main
+                row["category_sub"] = cat_sub
+
+            # 카테고리별 개별 CSV
+            write_csv(rows, cat_csv)
+            # 전체 합본 CSV에 append
+            write_csv(rows, combined_path, append=True)
+
+            print(f"  rows={len(rows)}  saved={cat_csv.name}")
+            summary.append({"category": f"{cat_main} > {cat_sub}", "rows": str(len(rows)), "status": "ok"})
+
         except Exception as exc:
-            if args.mode == "requests":
-                raise
-            print(f"fetch_method=requests_failed reason={type(exc).__name__}: {exc}")
+            print(f"  ERROR: {type(exc).__name__}: {exc}")
+            failed_categories.append(f"{cat_main} > {cat_sub}")
+            summary.append({"category": f"{cat_main} > {cat_sub}", "rows": "0", "status": f"error: {exc}"})
 
-    if not html:
-        html = fetch_rendered_html(
-            args.url,
-            args.max_items,
-            args.timeout_ms,
-            headless=not args.headed,
-            browser_executable_path=args.browser_executable_path,
-        )
-        print("fetch_method=browser")
+        # 마지막 카테고리가 아니면 딜레이
+        if idx < total:
+            time.sleep(args.delay_sec)
 
-    rows = parse_products(html, args.max_items)
-    if not rows:
-        raise RuntimeError("수집된 상품이 없습니다. 페이지 구조 또는 네트워크 상태를 확인하세요.")
+    # 결과 요약 출력
+    print("\n" + "=" * 60)
+    print(f"완료: {total - len(failed_categories)}/{total} 카테고리 성공")
+    print(f"합본 CSV: {combined_path}")
+    if failed_categories:
+        print(f"실패 카테고리 ({len(failed_categories)}개):")
+        for cat in failed_categories:
+            print(f"  - {cat}")
 
-    write_csv(rows, output_path)
-    print(f"rows={len(rows)}")
-    print(f"output={output_path}")
-    print(f"first_rank={rows[0].get('rank')} first_price={rows[0].get('final_price_krw')}")
-    print(f"last_rank={rows[-1].get('rank')} last_price={rows[-1].get('final_price_krw')}")
+    # ZIP 압축 (이메일 첨부용)
+    zip_path = DEFAULT_OUT_DIR / f"gmarket_best_{date_str}.zip"
+    zip_output_dir(out_dir, zip_path)
+    print(f"ZIP: {zip_path}")
+
+    if len(failed_categories) == total:
+        raise RuntimeError("모든 카테고리 크롤링에 실패했습니다.")
 
 
 if __name__ == "__main__":
