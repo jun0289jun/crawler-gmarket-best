@@ -12,7 +12,7 @@ permissions:
 jobs:
   crawl-and-email:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
@@ -45,7 +45,7 @@ jobs:
             echo "Using browser: $BROWSER_PATH"
           fi
 
-      - name: Crawl Gmarket Best 1-200
+      - name: Crawl Gmarket Best (전 카테고리 47개)
         run: |
           if [ -n "${BROWSER_EXECUTABLE_PATH:-}" ]; then
             xvfb-run -a python gmarket_best_crawler.py --max-items 200 --mode auto --headed --browser-executable-path "$BROWSER_EXECUTABLE_PATH"
@@ -53,11 +53,11 @@ jobs:
             python gmarket_best_crawler.py --max-items 200 --mode auto
           fi
 
-      - name: Upload CSV artifact
+      - name: Upload ZIP artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gmarket-best-csv
-          path: output/*.csv
+          name: gmarket-best-zip
+          path: output/*.zip
           if-no-files-found: error
           retention-days: 14
 
