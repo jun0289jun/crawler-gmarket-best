@@ -4,12 +4,14 @@ import argparse
 import csv
 import json
 import os
+import random
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -20,6 +22,50 @@ DEFAULT_MAX_ITEMS = 200
 
 RED_PRICE_RGB = "rgb(218, 18, 13)"  # #DA120D
 BLACK_PRICE_RGB = "rgb(66, 66, 66)"  # #424242
+
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+STEALTH_INIT_SCRIPT = r"""
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'languages', { get: () => ['ko-KR', 'ko', 'en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+window.chrome = window.chrome || { runtime: {} };
+const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (originalQuery) {
+  window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications'
+      ? Promise.resolve({ state: Notification.permission })
+      : originalQuery(parameters)
+  );
+}
+const getParameter = WebGLRenderingContext.prototype.getParameter;
+WebGLRenderingContext.prototype.getParameter = function(parameter) {
+  if (parameter === 37445) return 'Intel Inc.';
+  if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+  return getParameter.call(this, parameter);
+};
+"""
+
+
+class BlockedByBotError(RuntimeError):
+    pass
 
 
 def normalize_space(value: str) -> str:
@@ -63,9 +109,18 @@ def price_number(value: str) -> str:
     return m.group(1).replace(",", "") if m else ""
 
 
+def digits_only(value: Any) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+
 def percent_number(value: str) -> str:
     m = re.search(r"(\d+)\s*%", value or "")
     return m.group(1) if m else ""
+
+
+def is_bot_page(html_or_text: str) -> bool:
+    text = html_or_text or ""
+    return any(keyword in text for keyword in ["봇 확인", "간단한 확인 안내", "captcha", "cf-chl", "Cloudflare"])
 
 
 def fallback_parse_text(card_text: str) -> dict[str, str]:
@@ -99,14 +154,14 @@ def fallback_parse_text(card_text: str) -> dict[str, str]:
     return data
 
 
-def parse_next_items(soup: BeautifulSoup) -> dict[str, dict[str, Any]]:
+def extract_next_items(soup: BeautifulSoup) -> list[dict[str, Any]]:
     script = soup.select_one("script#__NEXT_DATA__")
     if not script or not script.string:
-        return {}
+        return []
     try:
         data = json.loads(script.string)
     except json.JSONDecodeError:
-        return {}
+        return []
 
     def walk(obj: Any) -> list[dict[str, Any]] | None:
         if isinstance(obj, dict):
@@ -125,8 +180,11 @@ def parse_next_items(soup: BeautifulSoup) -> dict[str, dict[str, Any]]:
                     return found
         return None
 
-    items = walk(data) or []
-    return {str(item.get("goodsCode", "")).strip(): item for item in items if item.get("goodsCode")}
+    return walk(data) or []
+
+
+def parse_next_items(soup: BeautifulSoup) -> dict[str, dict[str, Any]]:
+    return {str(item.get("goodsCode", "")).strip(): item for item in extract_next_items(soup) if item.get("goodsCode")}
 
 
 def normalized_color(node: Any) -> str:
@@ -195,6 +253,34 @@ def extract_final_price_from_dom(li: Any, parsed: dict[str, str]) -> tuple[str, 
     return parsed.get("sale_price_krw", ""), coupon_applied_price, "fallback:sale_price_text"
 
 
+def next_item_final_price(item: dict[str, Any]) -> tuple[str, str, str, str]:
+    price = digits_only(item.get("price"))
+    discount_price = digits_only(item.get("discountPrice"))
+    sell_price = digits_only(item.get("sellPrice"))
+    discount_rate = str(item.get("discountRate", "") or "")
+
+    if discount_price and (discount_price != price or digits_only(discount_rate) not in ["", "0"]):
+        return discount_price, sell_price or discount_price, price, "next_data:discountPrice_proxy_for_red_discount_price"
+    if price:
+        return price, sell_price or price, "", "next_data:price_proxy_for_black_price"
+    return sell_price, sell_price, "", "next_data:sellPrice_fallback"
+
+
+def fetch_static_html(url: str, timeout_sec: int) -> str:
+    session = requests.Session()
+    response = session.get(url, headers=REQUEST_HEADERS, timeout=timeout_sec, allow_redirects=True)
+    response.raise_for_status()
+    html = response.text
+    soup = BeautifulSoup(html, "html.parser")
+    has_next_items = bool(extract_next_items(soup))
+    has_dom_items = bool(soup.select("li.list-item"))
+    if is_bot_page(html) and not (has_next_items or has_dom_items):
+        raise BlockedByBotError("requests 방식이 G마켓 봇 확인 페이지를 받았습니다.")
+    if not (has_next_items or has_dom_items):
+        raise RuntimeError("requests 방식으로 상품 데이터가 포함된 HTML을 찾지 못했습니다.")
+    return html
+
+
 def fetch_rendered_html(
     url: str,
     max_items: int,
@@ -202,6 +288,10 @@ def fetch_rendered_html(
     headless: bool,
     browser_executable_path: str,
 ) -> str:
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    ]
     with sync_playwright() as p:
         launch_options: dict[str, Any] = {
             "headless": headless,
@@ -209,6 +299,8 @@ def fetch_rendered_html(
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--window-size=1440,1800",
             ],
         }
         if browser_executable_path:
@@ -217,12 +309,14 @@ def fetch_rendered_html(
         context = browser.new_context(
             locale="ko-KR",
             timezone_id="Asia/Seoul",
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-            ),
+            user_agent=random.choice(user_agents),
             viewport={"width": 1440, "height": 1800},
+            extra_http_headers={
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Upgrade-Insecure-Requests": "1",
+            },
         )
+        context.add_init_script(STEALTH_INIT_SCRIPT)
         page = context.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         try:
@@ -231,11 +325,10 @@ def fetch_rendered_html(
             page.wait_for_load_state("networkidle", timeout=timeout_ms)
 
         body_text = page.locator("body").inner_text(timeout=5000)
-        if "봇 확인" in body_text or "간단한 확인 안내" in body_text:
-            raise RuntimeError(
+        if is_bot_page(body_text):
+            raise BlockedByBotError(
                 "G마켓이 현재 브라우저 실행 방식을 봇으로 판별했습니다. "
-                "GitHub Actions에서는 시스템 Chrome/Chromium을 BROWSER_EXECUTABLE_PATH로 지정하고 "
-                "xvfb-run과 --headed 옵션으로 실행하세요."
+                "GitHub Actions 서버 IP 자체가 차단될 수 있으므로 README의 대안을 확인하세요."
             )
 
         previous_count = -1
@@ -267,6 +360,51 @@ def fetch_rendered_html(
         context.close()
         browser.close()
         return html
+
+
+def parse_products_from_next_data(soup: BeautifulSoup, max_items: int) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    seen_goodscode: set[str] = set()
+    for index, item in enumerate(extract_next_items(soup), start=1):
+        goodscode = str(item.get("goodsCode", "")).strip()
+        if not goodscode or goodscode in seen_goodscode:
+            continue
+        seen_goodscode.add(goodscode)
+        rank = int(item.get("rank") or index)
+        if rank > max_items:
+            continue
+        final_price_krw, sale_price_krw, original_price_krw, extraction_note = next_item_final_price(item)
+        delivery_fee = digits_only(item.get("deliveryFee"))
+        shipping_info = "무료배송" if delivery_fee in ["", "0"] else f"배송비 {delivery_fee}원"
+        lmos = item.get("lmos") if isinstance(item.get("lmos"), list) else []
+        mini_shop = item.get("miniShopInfo") if isinstance(item.get("miniShopInfo"), dict) else {}
+        image_url = normalize_url(str(item.get("imageUrl", "")))
+        product_url = normalize_url(str(item.get("linkUrl") or f"https://item.gmarket.co.kr/Item?goodscode={goodscode}"))
+        rows.append(
+            {
+                "rank": str(rank),
+                "product_name": str(item.get("goodsName", "")),
+                "final_price_krw": final_price_krw,
+                "sale_price_krw": sale_price_krw,
+                "coupon_applied_price_krw": "",
+                "original_price_krw": original_price_krw,
+                "discount_rate_percent": digits_only(item.get("discountRate")),
+                "payment_benefit_info": " | ".join(str(x) for x in lmos if x),
+                "shipping_info": shipping_info,
+                "fulfillment_info": "스타배송" if item.get("starDeliveryType") else "",
+                "arrival_info": str(item.get("arrivalShippingInfo", "")),
+                "review_count": str(item.get("reviewCount", "")),
+                "avg_star_point": str(item.get("avgStarPoint", "")),
+                "seller_name": str(mini_shop.get("nickName", "")),
+                "goodscode": goodscode,
+                "product_url": product_url,
+                "image_url": image_url,
+                "final_price_extraction_note": extraction_note,
+                "raw_text": "",
+            }
+        )
+    rows.sort(key=lambda r: int(r["rank"]) if r["rank"].isdigit() else 9999)
+    return rows[:max_items]
 
 
 def parse_products(html: str, max_items: int) -> list[dict[str, str]]:
@@ -332,9 +470,9 @@ def parse_products(html: str, max_items: int) -> list[dict[str, str]]:
         if item:
             product_name = product_name or str(item.get("goodsName", ""))
             if not sale_price_krw:
-                sale_price_krw = re.sub(r"\D", "", str(item.get("discountPrice", "")))
+                sale_price_krw = digits_only(item.get("discountPrice"))
             if not original_price_krw and item.get("price") and str(item.get("price")) != str(item.get("discountPrice")):
-                original_price_krw = re.sub(r"\D", "", str(item.get("price", "")))
+                original_price_krw = digits_only(item.get("price"))
             if not discount_rate_percent and item.get("discountRate"):
                 discount_rate_percent = str(item.get("discountRate"))
 
@@ -367,7 +505,7 @@ def parse_products(html: str, max_items: int) -> list[dict[str, str]]:
                 "arrival_info": parsed["arrival_info"],
                 "review_count": str(item.get("reviewCount", "")),
                 "avg_star_point": str(item.get("avgStarPoint", "")),
-                "seller_name": str((item.get("miniShopInfo") or {}).get("nickName", "")),
+                "seller_name": str(item.get("miniShopInfo", {}).get("nickName", "")) if isinstance(item.get("miniShopInfo"), dict) else "",
                 "goodscode": goodscode,
                 "product_url": link,
                 "image_url": image_url,
@@ -375,6 +513,9 @@ def parse_products(html: str, max_items: int) -> list[dict[str, str]]:
                 "raw_text": whole_text,
             }
         )
+
+    if not rows and next_items:
+        rows = parse_products_from_next_data(soup, max_items)
 
     rows.sort(key=lambda r: int(r["rank"]) if r["rank"].isdigit() else 9999)
     return rows[:max_items]
@@ -415,6 +556,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-items", type=int, default=DEFAULT_MAX_ITEMS, help="수집할 최대 상품 수")
     parser.add_argument("--output", default="", help="CSV 출력 경로. 미지정 시 output/gmarket_best_YYYYMMDD_HHMMSS.csv")
     parser.add_argument("--timeout-ms", type=int, default=60000, help="페이지 로딩 타임아웃(ms)")
+    parser.add_argument("--request-timeout-sec", type=int, default=30, help="requests SSR 시도 타임아웃(초)")
+    parser.add_argument("--mode", choices=["auto", "requests", "browser"], default="auto", help="수집 방식: auto는 requests를 먼저 시도한 뒤 브라우저로 fallback")
     parser.add_argument("--headed", action="store_true", help="가상 디스플레이 등에서 headed 브라우저로 실행")
     parser.add_argument(
         "--browser-executable-path",
@@ -428,13 +571,26 @@ def main() -> None:
     args = parse_args()
     output_path = Path(args.output) if args.output else DEFAULT_OUT_DIR / f"gmarket_best_{datetime.now():%Y%m%d_%H%M%S}.csv"
 
-    html = fetch_rendered_html(
-        args.url,
-        args.max_items,
-        args.timeout_ms,
-        headless=not args.headed,
-        browser_executable_path=args.browser_executable_path,
-    )
+    html = ""
+    if args.mode in ["auto", "requests"]:
+        try:
+            html = fetch_static_html(args.url, args.request_timeout_sec)
+            print("fetch_method=requests")
+        except Exception as exc:
+            if args.mode == "requests":
+                raise
+            print(f"fetch_method=requests_failed reason={type(exc).__name__}: {exc}")
+
+    if not html:
+        html = fetch_rendered_html(
+            args.url,
+            args.max_items,
+            args.timeout_ms,
+            headless=not args.headed,
+            browser_executable_path=args.browser_executable_path,
+        )
+        print("fetch_method=browser")
+
     rows = parse_products(html, args.max_items)
     if not rows:
         raise RuntimeError("수집된 상품이 없습니다. 페이지 구조 또는 네트워크 상태를 확인하세요.")
