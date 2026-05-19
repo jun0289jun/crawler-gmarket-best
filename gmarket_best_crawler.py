@@ -578,11 +578,13 @@ def parse_products(html: str, max_items: int) -> list[dict[str, str]]:
 
 
 CSV_FIELDNAMES = [
-    "category_main",
     "category_sub",
     "rank",
     "product_name",
     "final_price_krw",
+    "product_url",
+    "image_url",
+    "category_main",
     "sale_price_krw",
     "coupon_applied_price_krw",
     "original_price_krw",
@@ -595,8 +597,6 @@ CSV_FIELDNAMES = [
     "avg_star_point",
     "seller_name",
     "goodscode",
-    "product_url",
-    "image_url",
     "final_price_extraction_note",
     "raw_text",
 ]
