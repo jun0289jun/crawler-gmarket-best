@@ -76,6 +76,7 @@ CATEGORIES: list[tuple[str, str, str, str]] = [
 
 CATEGORY_CRAWL_DELAY_SEC = 3  # 카테고리 간 요청 딜레이 (봇 차단 방지)
 DETAIL_PAGE_DELAY_SEC = 0.5  # 상품 상세 페이지 간 요청 딜레이
+DETAIL_BOT_ERROR_LIMIT = 3
 
 RED_PRICE_RGB = "rgb(218, 18, 13)"  # #DA120D
 BLACK_PRICE_RGB = "rgb(66, 66, 66)"  # #424242
@@ -808,6 +809,7 @@ def enrich_rows_with_detail_pages(
     headed: bool,
     browser_executable_path: str,
     delay_sec: float,
+    stop_on_bot: bool,
 ) -> None:
     if not rows:
         return
@@ -842,6 +844,7 @@ def enrich_rows_with_detail_pages(
         )
         context.add_init_script(STEALTH_INIT_SCRIPT)
         page = context.new_page()
+        bot_error_count = 0
 
         for idx, row in enumerate(rows, start=1):
             product_url = row.get("product_url", "")
@@ -874,6 +877,18 @@ def enrich_rows_with_detail_pages(
                 apply_payment_benefit_to_row(row, "list")
                 append_extraction_note(row, f"detail_failed:{type(exc).__name__}")
                 print(f"    detail={idx}/{len(rows)} failed reason={type(exc).__name__}: {exc}")
+                if isinstance(exc, BlockedByBotError):
+                    bot_error_count += 1
+                    if stop_on_bot and bot_error_count >= DETAIL_BOT_ERROR_LIMIT:
+                        remaining = len(rows) - idx
+                        print(
+                            "    detail=disabled "
+                            f"reason=bot_detected count={bot_error_count} remaining={remaining}"
+                        )
+                        for rest_row in rows[idx:]:
+                            apply_payment_benefit_to_row(rest_row, "list")
+                            append_extraction_note(rest_row, "detail_skipped:bot_detected")
+                        break
             if idx < len(rows) and delay_sec > 0:
                 time.sleep(delay_sec)
 
@@ -896,6 +911,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["auto", "requests", "browser"], default="auto", help="수집 방식")
     parser.add_argument("--headed", action="store_true", help="headed 브라우저로 실행")
     parser.add_argument("--delay-sec", type=float, default=CATEGORY_CRAWL_DELAY_SEC, help="카테고리 간 딜레이(초)")
+    parser.add_argument(
+        "--detail-pages",
+        choices=["off", "auto", "force"],
+        default="off",
+        help="상품 상세 페이지 보강 방식: off=접속 안 함, auto=봇 감지 시 중단, force=끝까지 시도",
+    )
     parser.add_argument("--detail-delay-sec", type=float, default=DETAIL_PAGE_DELAY_SEC, help="상품 상세 페이지 간 딜레이(초)")
     parser.add_argument("--skip-detail-pages", action="store_true", help="상품 상세 페이지 열람 및 결제할인 보강을 건너뜁니다")
     parser.add_argument(
@@ -944,7 +965,7 @@ def main() -> None:
                 row["category_main"] = cat_main
                 row["category_sub"] = cat_sub
 
-            if args.skip_detail_pages:
+            if args.skip_detail_pages or args.detail_pages == "off":
                 for row in rows:
                     apply_payment_benefit_to_row(row, "list")
             else:
@@ -954,6 +975,7 @@ def main() -> None:
                     args.headed,
                     args.browser_executable_path,
                     args.detail_delay_sec,
+                    stop_on_bot=args.detail_pages == "auto",
                 )
 
             # 카테고리별 개별 CSV
