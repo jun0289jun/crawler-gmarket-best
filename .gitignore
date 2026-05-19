@@ -3,7 +3,7 @@ __pycache__/
 .venv/
 venv/
 .env
-output/*.csv
+output/
 playwright-report/
 test-results/
 .DS_Store
