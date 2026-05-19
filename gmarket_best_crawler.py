@@ -75,9 +75,34 @@ CATEGORIES: list[tuple[str, str, str, str]] = [
 ]
 
 CATEGORY_CRAWL_DELAY_SEC = 3  # 카테고리 간 요청 딜레이 (봇 차단 방지)
+DETAIL_PAGE_DELAY_SEC = 0.5  # 상품 상세 페이지 간 요청 딜레이
 
 RED_PRICE_RGB = "rgb(218, 18, 13)"  # #DA120D
 BLACK_PRICE_RGB = "rgb(66, 66, 66)"  # #424242
+
+DETAIL_PRICE_SELECTORS = [
+    ".price_real",
+    ".price .price_real",
+    ".box__price .text__value",
+    ".box__price-seller span.text.text__value",
+    ".item-topinfo .price",
+    ".item_price",
+    ".price_total",
+    ".price_sale",
+    "[class*='price'] strong",
+    "[class*='price'] span",
+]
+
+DETAIL_INFO_SELECTORS = [
+    "#itemcase_basic",
+    ".item-topinfo",
+    ".item-topinfowrap",
+    ".vip-content",
+    ".box__item-info",
+    ".box__benefit",
+    "[class*='benefit']",
+    "[class*='discount']",
+]
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -172,6 +197,80 @@ def digits_only(value: Any) -> str:
 def percent_number(value: str) -> str:
     m = re.search(r"(\d+)\s*%", value or "")
     return m.group(1) if m else ""
+
+
+def parse_price_int(value: Any) -> int:
+    digits = digits_only(value)
+    return int(digits) if digits else 0
+
+
+def money_amount_from_text(value: str) -> int:
+    text = normalize_space(value).replace(",", "")
+    if m := re.search(r"(\d+(?:\.\d+)?)\s*만\s*원?", text):
+        return int(float(m.group(1)) * 10000)
+    if m := re.search(r"(\d+(?:\.\d+)?)\s*천\s*원?", text):
+        return int(float(m.group(1)) * 1000)
+    if m := re.search(r"([0-9]+)\s*원", text):
+        return int(m.group(1))
+    return 0
+
+
+def extract_payment_benefit_labels(text: str) -> list[str]:
+    benefit_text = normalize_space(text)
+    if not benefit_text:
+        return []
+    pattern = re.compile(
+        r"결제\s*할인\s*(?:최대\s*)?(?:\d+(?:\.\d+)?\s*%|\d+(?:,\d{3})*(?:\.\d+)?\s*(?:만|천)?\s*원?)"
+    )
+    return list(dict.fromkeys(normalize_space(match.group(0)) for match in pattern.finditer(benefit_text)))
+
+
+def merge_pipe_values(*values: str) -> str:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for part in str(value or "").split("|"):
+            item = normalize_space(part)
+            if item and item not in seen:
+                seen.add(item)
+                merged.append(item)
+    return " | ".join(merged)
+
+
+def append_extraction_note(row: dict[str, str], note: str) -> None:
+    if not note:
+        return
+    row["final_price_extraction_note"] = merge_pipe_values(row.get("final_price_extraction_note", ""), note)
+
+
+def best_payment_benefit_discount(price: int, benefit_info: str) -> tuple[int, str]:
+    if price <= 0 or not benefit_info:
+        return 0, ""
+
+    best_discount = 0
+    best_label = ""
+    for label in extract_payment_benefit_labels(benefit_info):
+        discount = 0
+        if m := re.search(r"(\d+(?:\.\d+)?)\s*%", label):
+            discount = int(price * float(m.group(1)) / 100)
+        else:
+            discount = money_amount_from_text(label)
+        discount = max(0, min(discount, price))
+        if discount > best_discount:
+            best_discount = discount
+            best_label = label
+    return best_discount, best_label
+
+
+def apply_payment_benefit_to_row(row: dict[str, str], source: str) -> None:
+    base_price = parse_price_int(
+        row.get("final_price_krw") or row.get("coupon_applied_price_krw") or row.get("sale_price_krw")
+    )
+    discount, label = best_payment_benefit_discount(base_price, row.get("payment_benefit_info", ""))
+    if not discount:
+        return
+    row["final_price_krw"] = str(max(base_price - discount, 0))
+    append_extraction_note(row, f"{source}:payment_benefit:{label}:discount={discount}")
 
 
 def is_bot_page(html_or_text: str) -> bool:
@@ -645,6 +744,143 @@ def crawl_one(
     return html
 
 
+def price_from_detail_text(text: str) -> tuple[str, str]:
+    normalized = normalize_space(text)
+    label_patterns = [
+        (r"(?:최종혜택가|최종\s*혜택가|최종가|혜택가)\s*([0-9][0-9,]*)\s*원", "detail_text:final_benefit_price"),
+        (r"(?:쿠폰적용가|쿠폰\s*적용가)\s*([0-9][0-9,]*)\s*원", "detail_text:coupon_price"),
+        (r"(?:즉시할인가|할인가|판매가)\s*([0-9][0-9,]*)\s*원", "detail_text:sale_price"),
+    ]
+    for pattern, note in label_patterns:
+        if m := re.search(pattern, normalized):
+            return m.group(1).replace(",", ""), note
+    return "", ""
+
+
+def extract_detail_page_info(page: Any) -> dict[str, str]:
+    page.evaluate(
+        """
+        () => {
+          document.querySelectorAll("[class*='price'], [id*='price']").forEach((node) => {
+            node.setAttribute('data-computed-color', window.getComputedStyle(node).color);
+          });
+        }
+        """
+    )
+
+    selector_prices: list[str] = []
+    for selector in DETAIL_PRICE_SELECTORS:
+        texts = page.locator(selector).all_inner_texts()
+        for text in texts:
+            value = price_number(normalize_space(text))
+            if value:
+                selector_prices.append(value)
+        if selector_prices:
+            break
+
+    detail_text_parts: list[str] = []
+    for selector in DETAIL_INFO_SELECTORS:
+        for text in page.locator(selector).all_inner_texts():
+            normalized = normalize_space(text)
+            if normalized:
+                detail_text_parts.append(normalized)
+
+    body_text = page.locator("body").inner_text(timeout=5000)
+    detail_text = normalize_space(" ".join(detail_text_parts)) or body_text
+    benefit_labels = extract_payment_benefit_labels(detail_text)
+    detail_price, note = price_from_detail_text(detail_text)
+    if not detail_price and selector_prices:
+        detail_price = selector_prices[-1]
+        note = "detail_dom:price_selector"
+    if not benefit_labels:
+        benefit_labels = extract_payment_benefit_labels(body_text)
+
+    return {
+        "final_price_krw": detail_price,
+        "payment_benefit_info": " | ".join(benefit_labels),
+        "final_price_extraction_note": note,
+    }
+
+
+def enrich_rows_with_detail_pages(
+    rows: list[dict[str, str]],
+    timeout_ms: int,
+    headed: bool,
+    browser_executable_path: str,
+    delay_sec: float,
+) -> None:
+    if not rows:
+        return
+
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    ]
+    with sync_playwright() as p:
+        launch_options: dict[str, Any] = {
+            "headless": not headed,
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--window-size=1440,1800",
+            ],
+        }
+        if browser_executable_path:
+            launch_options["executable_path"] = browser_executable_path
+        browser = p.chromium.launch(**launch_options)
+        context = browser.new_context(
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            user_agent=random.choice(user_agents),
+            viewport={"width": 1440, "height": 1800},
+            extra_http_headers={
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Upgrade-Insecure-Requests": "1",
+            },
+        )
+        context.add_init_script(STEALTH_INIT_SCRIPT)
+        page = context.new_page()
+
+        for idx, row in enumerate(rows, start=1):
+            product_url = row.get("product_url", "")
+            if not product_url:
+                apply_payment_benefit_to_row(row, "list")
+                continue
+            try:
+                page.goto(product_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except PlaywrightTimeoutError:
+                    pass
+                page.wait_for_timeout(500)
+
+                body_text = page.locator("body").inner_text(timeout=5000)
+                if is_bot_page(body_text):
+                    raise BlockedByBotError("상품 상세 페이지가 봇 확인 페이지를 반환했습니다.")
+
+                detail = extract_detail_page_info(page)
+                if detail["final_price_krw"]:
+                    row["final_price_krw"] = detail["final_price_krw"]
+                    append_extraction_note(row, detail["final_price_extraction_note"])
+                row["payment_benefit_info"] = merge_pipe_values(
+                    row.get("payment_benefit_info", ""),
+                    detail["payment_benefit_info"],
+                )
+                apply_payment_benefit_to_row(row, "detail")
+                print(f"    detail={idx}/{len(rows)} ok")
+            except Exception as exc:
+                apply_payment_benefit_to_row(row, "list")
+                append_extraction_note(row, f"detail_failed:{type(exc).__name__}")
+                print(f"    detail={idx}/{len(rows)} failed reason={type(exc).__name__}: {exc}")
+            if idx < len(rows) and delay_sec > 0:
+                time.sleep(delay_sec)
+
+        context.close()
+        browser.close()
+
+
 def zip_output_dir(dir_path: Path, zip_path: Path) -> None:
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for csv_file in sorted(dir_path.glob("*.csv")):
@@ -660,6 +896,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["auto", "requests", "browser"], default="auto", help="수집 방식")
     parser.add_argument("--headed", action="store_true", help="headed 브라우저로 실행")
     parser.add_argument("--delay-sec", type=float, default=CATEGORY_CRAWL_DELAY_SEC, help="카테고리 간 딜레이(초)")
+    parser.add_argument("--detail-delay-sec", type=float, default=DETAIL_PAGE_DELAY_SEC, help="상품 상세 페이지 간 딜레이(초)")
+    parser.add_argument("--skip-detail-pages", action="store_true", help="상품 상세 페이지 열람 및 결제할인 보강을 건너뜁니다")
     parser.add_argument(
         "--browser-executable-path",
         default=os.getenv("BROWSER_EXECUTABLE_PATH", ""),
@@ -705,6 +943,18 @@ def main() -> None:
             for row in rows:
                 row["category_main"] = cat_main
                 row["category_sub"] = cat_sub
+
+            if args.skip_detail_pages:
+                for row in rows:
+                    apply_payment_benefit_to_row(row, "list")
+            else:
+                enrich_rows_with_detail_pages(
+                    rows,
+                    args.timeout_ms,
+                    args.headed,
+                    args.browser_executable_path,
+                    args.detail_delay_sec,
+                )
 
             # 카테고리별 개별 CSV
             write_csv(rows, cat_csv)
