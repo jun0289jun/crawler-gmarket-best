@@ -941,8 +941,13 @@ def enrich_rows_with_detail_pages(
                     if idx < len(rows) and delay_sec > 0:
                         time.sleep(delay_sec)
                     continue
-                except BlockedByBotError:
-                    raise
+                except BlockedByBotError as static_block_exc:
+                    if stop_on_bot:
+                        raise
+                    print(
+                        f"    detail={idx}/{len(rows)} requests_blocked "
+                        f"reason={type(static_block_exc).__name__}: {static_block_exc}"
+                    )
                 except Exception as static_exc:
                     print(
                         f"    detail={idx}/{len(rows)} requests_failed "
