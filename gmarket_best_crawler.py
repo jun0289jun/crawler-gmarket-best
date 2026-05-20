@@ -459,6 +459,7 @@ def fetch_rendered_html(
         )
         page = context.new_page()
         STEALTH.apply_stealth_sync(page)
+        page.add_init_script("window.close = function() {};")
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         try:
             page.wait_for_selector("li.list-item", timeout=timeout_ms)
@@ -911,12 +912,23 @@ def enrich_rows_with_detail_pages(
         )
         page = context.new_page()
         STEALTH.apply_stealth_sync(page)
+        page.add_init_script("window.close = function() {};")
         page.goto(source_url, wait_until="domcontentloaded", timeout=timeout_ms)
         try:
             page.wait_for_selector("li.list-item", timeout=10000)
         except PlaywrightTimeoutError:
             pass
         return page
+
+    def reset_browser() -> None:
+        nonlocal playwright, browser, context, page
+        for obj, method in [(context, "close"), (browser, "close"), (playwright, "stop")]:
+            if obj is not None:
+                try:
+                    getattr(obj, method)()
+                except Exception:
+                    pass
+        playwright = browser = context = page = None
 
     try:
         for idx, row in enumerate(rows, start=1):
@@ -964,6 +976,8 @@ def enrich_rows_with_detail_pages(
                 apply_payment_benefit_to_row(row, "list")
                 append_extraction_note(row, f"detail_failed:{type(exc).__name__}")
                 print(f"    detail={idx}/{len(rows)} failed reason={type(exc).__name__}: {exc}")
+                if "closed" in str(exc).lower():
+                    reset_browser()
                 if isinstance(exc, BlockedByBotError):
                     bot_error_count += 1
                     if stop_on_bot and bot_error_count >= DETAIL_BOT_ERROR_LIMIT:
