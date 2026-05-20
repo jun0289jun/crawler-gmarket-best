@@ -463,9 +463,20 @@ def fetch_rendered_html(
     headless: bool,
     browser_executable_path: str,
     user_data_dir: str = "",
+    cdp_url: str = "",
 ) -> str:
     with sync_playwright() as p:
-        if user_data_dir:
+        external_browser = False
+        if cdp_url:
+            browser = p.chromium.connect_over_cdp(cdp_url)
+            context = browser.contexts[0] if browser.contexts else browser.new_context(
+                locale="ko-KR",
+                timezone_id="Asia/Seoul",
+                viewport={"width": 1440, "height": 1800},
+                extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"},
+            )
+            external_browser = True
+        elif user_data_dir:
             persistent_opts: dict[str, Any] = {
                 "headless": headless,
                 "args": BROWSER_LAUNCH_ARGS,
@@ -533,8 +544,9 @@ def fetch_rendered_html(
             """
         )
         html = page.content()
-        context.close()
-        if browser is not None:
+        if not external_browser:
+            context.close()
+        if browser is not None and not external_browser:
             browser.close()
         return html
 
@@ -743,6 +755,7 @@ def crawl_one(
     headed: bool,
     browser_executable_path: str,
     user_data_dir: str = "",
+    cdp_url: str = "",
 ) -> str:
     """단일 URL을 크롤링해 HTML 반환. 실패 시 예외를 그대로 raise."""
     html = ""
@@ -763,6 +776,7 @@ def crawl_one(
             headless=not headed,
             browser_executable_path=browser_executable_path,
             user_data_dir=user_data_dir,
+            cdp_url=cdp_url,
         )
         print("  fetch_method=browser")
     return html
@@ -905,6 +919,7 @@ def enrich_rows_with_detail_pages(
     delay_sec: float,
     stop_on_bot: bool,
     user_data_dir: str = "",
+    cdp_url: str = "",
 ) -> None:
     if not rows:
         return
@@ -914,14 +929,25 @@ def enrich_rows_with_detail_pages(
     browser = None
     context = None
     page = None
+    external_browser = False
     bot_error_count = 0
 
     def get_browser_page() -> Any:
-        nonlocal playwright, browser, context, page
+        nonlocal playwright, browser, context, page, external_browser
         if page is not None:
             return page
         playwright = sync_playwright().start()
-        if user_data_dir:
+        if cdp_url:
+            cdp_browser = playwright.chromium.connect_over_cdp(cdp_url)
+            context = cdp_browser.contexts[0] if cdp_browser.contexts else cdp_browser.new_context(
+                locale="ko-KR",
+                timezone_id="Asia/Seoul",
+                viewport={"width": 1440, "height": 1800},
+                extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"},
+            )
+            external_browser = True
+            browser = None
+        elif user_data_dir:
             persistent_opts: dict[str, Any] = {
                 "headless": not headed,
                 "args": BROWSER_LAUNCH_ARGS,
@@ -958,14 +984,24 @@ def enrich_rows_with_detail_pages(
         return page
 
     def reset_browser() -> None:
-        nonlocal playwright, browser, context, page
-        for obj, method in [(context, "close"), (browser, "close"), (playwright, "stop")]:
-            if obj is not None:
-                try:
-                    getattr(obj, method)()
-                except Exception:
-                    pass
+        nonlocal playwright, browser, context, page, external_browser
+        if context is not None and not external_browser:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if browser is not None and not external_browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
         playwright = browser = context = page = None
+        external_browser = False
 
     try:
         for idx, row in enumerate(rows, start=1):
@@ -1030,7 +1066,7 @@ def enrich_rows_with_detail_pages(
             if idx < len(rows) and delay_sec > 0:
                 time.sleep(delay_sec)
     finally:
-        if context is not None:
+        if context is not None and not external_browser:
             context.close()
         if browser is not None:  # persistent context면 None
             browser.close()
@@ -1071,6 +1107,11 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("CHROME_USER_DATA_DIR", ""),
         help="실제 Chrome 프로필 경로 (예: C:\\Users\\이름\\AppData\\Local\\Google\\Chrome\\User Data)",
     )
+    parser.add_argument(
+        "--cdp-url",
+        default=os.getenv("CHROME_CDP_URL", ""),
+        help="이미 실행 중인 Chrome 원격 디버깅 URL (예: http://127.0.0.1:9222)",
+    )
     return parser.parse_args()
 
 
@@ -1103,6 +1144,7 @@ def main() -> None:
                 args.headed,
                 args.browser_executable_path,
                 args.user_data_dir,
+                args.cdp_url,
             )
             rows = parse_products(html, args.max_items)
             if not rows:
@@ -1127,6 +1169,7 @@ def main() -> None:
                     args.detail_delay_sec,
                     stop_on_bot=args.detail_pages == "auto",
                     user_data_dir=args.user_data_dir,
+                    cdp_url=args.cdp_url,
                 )
 
             # 카테고리별 개별 CSV
