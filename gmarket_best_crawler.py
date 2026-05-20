@@ -874,6 +874,7 @@ def extract_rendered_detail_page_info(page: Any) -> dict[str, str]:
 
 def enrich_rows_with_detail_pages(
     rows: list[dict[str, str]],
+    source_url: str,
     timeout_ms: int,
     request_timeout_sec: int,
     headed: bool,
@@ -925,6 +926,11 @@ def enrich_rows_with_detail_pages(
         )
         context.add_init_script(STEALTH_INIT_SCRIPT)
         page = context.new_page()
+        page.goto(source_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        try:
+            page.wait_for_selector("li.list-item", timeout=10000)
+        except PlaywrightTimeoutError:
+            pass
         return page
 
     try:
@@ -955,7 +961,7 @@ def enrich_rows_with_detail_pages(
                     )
 
                 page = get_browser_page()
-                page.goto(product_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                page.goto(product_url, wait_until="domcontentloaded", timeout=timeout_ms, referer=source_url)
                 try:
                     page.wait_for_load_state("networkidle", timeout=10000)
                 except PlaywrightTimeoutError:
@@ -1071,6 +1077,7 @@ def main() -> None:
             else:
                 enrich_rows_with_detail_pages(
                     rows,
+                    url,
                     args.timeout_ms,
                     args.request_timeout_sec,
                     args.headed,
