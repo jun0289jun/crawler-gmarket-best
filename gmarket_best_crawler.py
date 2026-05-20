@@ -18,6 +18,7 @@ import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+from playwright_stealth import Stealth
 
 BEST_URL = "https://www.gmarket.co.kr/n/best"
 DEFAULT_OUT_DIR = Path("output")
@@ -122,28 +123,12 @@ REQUEST_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-STEALTH_INIT_SCRIPT = r"""
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-Object.defineProperty(navigator, 'languages', { get: () => ['ko-KR', 'ko', 'en-US', 'en'] });
-Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-window.chrome = window.chrome || { runtime: {} };
-const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
-if (originalQuery) {
-  window.navigator.permissions.query = (parameters) => (
-    parameters.name === 'notifications'
-      ? Promise.resolve({ state: Notification.permission })
-      : originalQuery(parameters)
-  );
-}
-const getParameter = WebGLRenderingContext.prototype.getParameter;
-WebGLRenderingContext.prototype.getParameter = function(parameter) {
-  if (parameter === 37445) return 'Intel Inc.';
-  if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-  return getParameter.call(this, parameter);
-};
-"""
+STEALTH = Stealth(
+    navigator_languages_override=("ko-KR", "ko", "en-US", "en"),
+    navigator_platform_override="Win32",
+    webgl_vendor_override="Intel Inc.",
+    webgl_renderer_override="Intel Iris OpenGL Engine",
+)
 
 
 class BlockedByBotError(RuntimeError):
@@ -472,8 +457,8 @@ def fetch_rendered_html(
                 "Upgrade-Insecure-Requests": "1",
             },
         )
-        context.add_init_script(STEALTH_INIT_SCRIPT)
         page = context.new_page()
+        STEALTH.apply_stealth_sync(page)
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         try:
             page.wait_for_selector("li.list-item", timeout=timeout_ms)
@@ -924,8 +909,8 @@ def enrich_rows_with_detail_pages(
                 "Upgrade-Insecure-Requests": "1",
             },
         )
-        context.add_init_script(STEALTH_INIT_SCRIPT)
         page = context.new_page()
+        STEALTH.apply_stealth_sync(page)
         page.goto(source_url, wait_until="domcontentloaded", timeout=timeout_ms)
         try:
             page.wait_for_selector("li.list-item", timeout=10000)
