@@ -758,7 +758,74 @@ def price_from_detail_text(text: str) -> tuple[str, str]:
     return "", ""
 
 
-def extract_detail_page_info(page: Any) -> dict[str, str]:
+def detail_info_has_value(detail: dict[str, str]) -> bool:
+    return bool(detail.get("final_price_krw") or detail.get("payment_benefit_info"))
+
+
+def apply_detail_info_to_row(row: dict[str, str], detail: dict[str, str], source: str) -> None:
+    if detail.get("final_price_krw"):
+        row["final_price_krw"] = detail["final_price_krw"]
+        append_extraction_note(row, f"{source}:{detail.get('final_price_extraction_note', '')}")
+    row["payment_benefit_info"] = merge_pipe_values(
+        row.get("payment_benefit_info", ""),
+        detail.get("payment_benefit_info", ""),
+    )
+    apply_payment_benefit_to_row(row, source)
+
+
+def extract_detail_page_info_from_soup(soup: BeautifulSoup) -> dict[str, str]:
+    selector_prices: list[str] = []
+    for selector in DETAIL_PRICE_SELECTORS:
+        for node in soup.select(selector):
+            value = price_number(normalize_space(node.get_text(" ", strip=True)))
+            if value:
+                selector_prices.append(value)
+        if selector_prices:
+            break
+
+    detail_text_parts: list[str] = []
+    for selector in DETAIL_INFO_SELECTORS:
+        for node in soup.select(selector):
+            normalized = normalize_space(node.get_text(" ", strip=True))
+            if normalized:
+                detail_text_parts.append(normalized)
+
+    body_text = normalize_space(soup.get_text(" ", strip=True))
+    detail_text = normalize_space(" ".join(detail_text_parts)) or body_text
+    benefit_labels = extract_payment_benefit_labels(detail_text)
+    detail_price, note = price_from_detail_text(detail_text)
+    if not detail_price and selector_prices:
+        detail_price = selector_prices[-1]
+        note = "detail_static:price_selector"
+    if not benefit_labels:
+        benefit_labels = extract_payment_benefit_labels(body_text)
+
+    return {
+        "final_price_krw": detail_price,
+        "payment_benefit_info": " | ".join(benefit_labels),
+        "final_price_extraction_note": note,
+    }
+
+
+def fetch_static_detail_info(session: requests.Session, url: str, timeout_sec: int) -> dict[str, str]:
+    headers = {
+        **REQUEST_HEADERS,
+        "Referer": BEST_URL,
+        "Sec-Fetch-Site": "same-site",
+    }
+    response = session.get(url, headers=headers, timeout=timeout_sec, allow_redirects=True)
+    response.raise_for_status()
+    html = response.text
+    soup = BeautifulSoup(html, "html.parser")
+    detail = extract_detail_page_info_from_soup(soup)
+    if is_bot_page(html) and not detail_info_has_value(detail):
+        raise BlockedByBotError("requests 상세 페이지가 봇 확인 페이지를 받았습니다.")
+    if not detail_info_has_value(detail):
+        raise RuntimeError("requests 상세 페이지에서 가격/결제할인 정보를 찾지 못했습니다.")
+    return detail
+
+
+def extract_rendered_detail_page_info(page: Any) -> dict[str, str]:
     page.evaluate(
         """
         () => {
@@ -806,6 +873,7 @@ def extract_detail_page_info(page: Any) -> dict[str, str]:
 def enrich_rows_with_detail_pages(
     rows: list[dict[str, str]],
     timeout_ms: int,
+    request_timeout_sec: int,
     headed: bool,
     browser_executable_path: str,
     delay_sec: float,
@@ -818,7 +886,18 @@ def enrich_rows_with_detail_pages(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     ]
-    with sync_playwright() as p:
+    detail_session = requests.Session()
+    playwright = None
+    browser = None
+    context = None
+    page = None
+    bot_error_count = 0
+
+    def get_browser_page() -> Any:
+        nonlocal playwright, browser, context, page
+        if page is not None:
+            return page
+        playwright = sync_playwright().start()
         launch_options: dict[str, Any] = {
             "headless": not headed,
             "args": [
@@ -831,7 +910,7 @@ def enrich_rows_with_detail_pages(
         }
         if browser_executable_path:
             launch_options["executable_path"] = browser_executable_path
-        browser = p.chromium.launch(**launch_options)
+        browser = playwright.chromium.launch(**launch_options)
         context = browser.new_context(
             locale="ko-KR",
             timezone_id="Asia/Seoul",
@@ -844,14 +923,31 @@ def enrich_rows_with_detail_pages(
         )
         context.add_init_script(STEALTH_INIT_SCRIPT)
         page = context.new_page()
-        bot_error_count = 0
+        return page
 
+    try:
         for idx, row in enumerate(rows, start=1):
             product_url = row.get("product_url", "")
             if not product_url:
                 apply_payment_benefit_to_row(row, "list")
                 continue
             try:
+                try:
+                    detail = fetch_static_detail_info(detail_session, product_url, request_timeout_sec)
+                    apply_detail_info_to_row(row, detail, "detail_requests")
+                    print(f"    detail={idx}/{len(rows)} ok method=requests")
+                    if idx < len(rows) and delay_sec > 0:
+                        time.sleep(delay_sec)
+                    continue
+                except BlockedByBotError:
+                    raise
+                except Exception as static_exc:
+                    print(
+                        f"    detail={idx}/{len(rows)} requests_failed "
+                        f"reason={type(static_exc).__name__}: {static_exc}"
+                    )
+
+                page = get_browser_page()
                 page.goto(product_url, wait_until="domcontentloaded", timeout=timeout_ms)
                 try:
                     page.wait_for_load_state("networkidle", timeout=10000)
@@ -863,16 +959,9 @@ def enrich_rows_with_detail_pages(
                 if is_bot_page(body_text):
                     raise BlockedByBotError("상품 상세 페이지가 봇 확인 페이지를 반환했습니다.")
 
-                detail = extract_detail_page_info(page)
-                if detail["final_price_krw"]:
-                    row["final_price_krw"] = detail["final_price_krw"]
-                    append_extraction_note(row, detail["final_price_extraction_note"])
-                row["payment_benefit_info"] = merge_pipe_values(
-                    row.get("payment_benefit_info", ""),
-                    detail["payment_benefit_info"],
-                )
-                apply_payment_benefit_to_row(row, "detail")
-                print(f"    detail={idx}/{len(rows)} ok")
+                detail = extract_rendered_detail_page_info(page)
+                apply_detail_info_to_row(row, detail, "detail_browser")
+                print(f"    detail={idx}/{len(rows)} ok method=browser")
             except Exception as exc:
                 apply_payment_benefit_to_row(row, "list")
                 append_extraction_note(row, f"detail_failed:{type(exc).__name__}")
@@ -891,9 +980,13 @@ def enrich_rows_with_detail_pages(
                         break
             if idx < len(rows) and delay_sec > 0:
                 time.sleep(delay_sec)
-
-        context.close()
-        browser.close()
+    finally:
+        if context is not None:
+            context.close()
+        if browser is not None:
+            browser.close()
+        if playwright is not None:
+            playwright.stop()
 
 
 def zip_output_dir(dir_path: Path, zip_path: Path) -> None:
@@ -972,6 +1065,7 @@ def main() -> None:
                 enrich_rows_with_detail_pages(
                     rows,
                     args.timeout_ms,
+                    args.request_timeout_sec,
                     args.headed,
                     args.browser_executable_path,
                     args.detail_delay_sec,
