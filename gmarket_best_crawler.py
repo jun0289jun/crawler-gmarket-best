@@ -76,6 +76,17 @@ CATEGORIES: list[tuple[str, str, str, str]] = [
 ]
 
 CATEGORY_CRAWL_DELAY_SEC = 3  # 카테고리 간 요청 딜레이 (봇 차단 방지)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
+BROWSER_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--window-size=1440,1800",
+]
 DETAIL_PAGE_DELAY_SEC = 0.5  # 상품 상세 페이지 간 요청 딜레이
 DETAIL_BOT_ERROR_LIMIT = 3
 
@@ -451,35 +462,35 @@ def fetch_rendered_html(
     timeout_ms: int,
     headless: bool,
     browser_executable_path: str,
+    user_data_dir: str = "",
 ) -> str:
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    ]
     with sync_playwright() as p:
-        launch_options: dict[str, Any] = {
-            "headless": headless,
-            "args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--window-size=1440,1800",
-            ],
-        }
-        if browser_executable_path:
-            launch_options["executable_path"] = browser_executable_path
-        browser = p.chromium.launch(**launch_options)
-        context = browser.new_context(
-            locale="ko-KR",
-            timezone_id="Asia/Seoul",
-            user_agent=random.choice(user_agents),
-            viewport={"width": 1440, "height": 1800},
-            extra_http_headers={
-                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Upgrade-Insecure-Requests": "1",
-            },
-        )
+        if user_data_dir:
+            persistent_opts: dict[str, Any] = {
+                "headless": headless,
+                "args": BROWSER_LAUNCH_ARGS,
+                "locale": "ko-KR",
+                "timezone_id": "Asia/Seoul",
+                "viewport": {"width": 1440, "height": 1800},
+                "extra_http_headers": {"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"},
+            }
+            if browser_executable_path:
+                persistent_opts["executable_path"] = browser_executable_path
+            browser = None
+            context = p.chromium.launch_persistent_context(user_data_dir, **persistent_opts)
+        else:
+            launch_options: dict[str, Any] = {"headless": headless, "args": BROWSER_LAUNCH_ARGS}
+            if browser_executable_path:
+                launch_options["executable_path"] = browser_executable_path
+            browser = p.chromium.launch(**launch_options)
+            context = browser.new_context(
+                locale="ko-KR",
+                timezone_id="Asia/Seoul",
+                user_agent=random.choice(USER_AGENTS),
+                viewport={"width": 1440, "height": 1800},
+                extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                                    "Upgrade-Insecure-Requests": "1"},
+            )
         page = context.new_page()
         STEALTH.apply_stealth_sync(page)
         page.add_init_script("window.close = function() {};")
@@ -523,7 +534,8 @@ def fetch_rendered_html(
         )
         html = page.content()
         context.close()
-        browser.close()
+        if browser is not None:
+            browser.close()
         return html
 
 
@@ -730,6 +742,7 @@ def crawl_one(
     mode: str,
     headed: bool,
     browser_executable_path: str,
+    user_data_dir: str = "",
 ) -> str:
     """단일 URL을 크롤링해 HTML 반환. 실패 시 예외를 그대로 raise."""
     html = ""
@@ -749,6 +762,7 @@ def crawl_one(
             timeout_ms,
             headless=not headed,
             browser_executable_path=browser_executable_path,
+            user_data_dir=user_data_dir,
         )
         print("  fetch_method=browser")
     return html
@@ -890,14 +904,11 @@ def enrich_rows_with_detail_pages(
     browser_executable_path: str,
     delay_sec: float,
     stop_on_bot: bool,
+    user_data_dir: str = "",
 ) -> None:
     if not rows:
         return
 
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    ]
     detail_session = requests.Session()
     playwright = None
     browser = None
@@ -910,29 +921,32 @@ def enrich_rows_with_detail_pages(
         if page is not None:
             return page
         playwright = sync_playwright().start()
-        launch_options: dict[str, Any] = {
-            "headless": not headed,
-            "args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--window-size=1440,1800",
-            ],
-        }
-        if browser_executable_path:
-            launch_options["executable_path"] = browser_executable_path
-        browser = playwright.chromium.launch(**launch_options)
-        context = browser.new_context(
-            locale="ko-KR",
-            timezone_id="Asia/Seoul",
-            user_agent=random.choice(user_agents),
-            viewport={"width": 1440, "height": 1800},
-            extra_http_headers={
-                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Upgrade-Insecure-Requests": "1",
-            },
-        )
+        if user_data_dir:
+            persistent_opts: dict[str, Any] = {
+                "headless": not headed,
+                "args": BROWSER_LAUNCH_ARGS,
+                "locale": "ko-KR",
+                "timezone_id": "Asia/Seoul",
+                "viewport": {"width": 1440, "height": 1800},
+                "extra_http_headers": {"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"},
+            }
+            if browser_executable_path:
+                persistent_opts["executable_path"] = browser_executable_path
+            browser = None
+            context = playwright.chromium.launch_persistent_context(user_data_dir, **persistent_opts)
+        else:
+            launch_options: dict[str, Any] = {"headless": not headed, "args": BROWSER_LAUNCH_ARGS}
+            if browser_executable_path:
+                launch_options["executable_path"] = browser_executable_path
+            browser = playwright.chromium.launch(**launch_options)
+            context = browser.new_context(
+                locale="ko-KR",
+                timezone_id="Asia/Seoul",
+                user_agent=random.choice(USER_AGENTS),
+                viewport={"width": 1440, "height": 1800},
+                extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                                    "Upgrade-Insecure-Requests": "1"},
+            )
         page = context.new_page()
         STEALTH.apply_stealth_sync(page)
         page.add_init_script("window.close = function() {};")
@@ -1018,7 +1032,7 @@ def enrich_rows_with_detail_pages(
     finally:
         if context is not None:
             context.close()
-        if browser is not None:
+        if browser is not None:  # persistent context면 None
             browser.close()
         if playwright is not None:
             playwright.stop()
@@ -1052,6 +1066,11 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("BROWSER_EXECUTABLE_PATH", ""),
         help="시스템 Chrome/Chromium 실행 파일 경로",
     )
+    parser.add_argument(
+        "--user-data-dir",
+        default=os.getenv("CHROME_USER_DATA_DIR", ""),
+        help="실제 Chrome 프로필 경로 (예: C:\\Users\\이름\\AppData\\Local\\Google\\Chrome\\User Data)",
+    )
     return parser.parse_args()
 
 
@@ -1083,6 +1102,7 @@ def main() -> None:
                 args.mode,
                 args.headed,
                 args.browser_executable_path,
+                args.user_data_dir,
             )
             rows = parse_products(html, args.max_items)
             if not rows:
@@ -1106,6 +1126,7 @@ def main() -> None:
                     args.browser_executable_path,
                     args.detail_delay_sec,
                     stop_on_bot=args.detail_pages == "auto",
+                    user_data_dir=args.user_data_dir,
                 )
 
             # 카테고리별 개별 CSV
