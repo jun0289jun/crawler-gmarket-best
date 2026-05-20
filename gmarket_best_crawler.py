@@ -205,10 +205,27 @@ def extract_payment_benefit_labels(text: str) -> list[str]:
     benefit_text = normalize_space(text)
     if not benefit_text:
         return []
-    pattern = re.compile(
-        r"결제\s*할인\s*(?:최대\s*)?(?:\d+(?:\.\d+)?\s*%|\d+(?:,\d{3})*(?:\.\d+)?\s*(?:만|천)?\s*원?)"
-    )
-    return list(dict.fromkeys(normalize_space(match.group(0)) for match in pattern.finditer(benefit_text)))
+    results: list[str] = []
+    seen: set[str] = set()
+    # Format 1: "결제할인 최대 N원/%" (조건 없는 표준형)
+    for m in re.finditer(
+        r"결제\s*할인\s*(?:최대\s*)?(?:\d+(?:\.\d+)?\s*%|\d+(?:,\d{3})*(?:\.\d+)?\s*(?:만|천)?\s*원?)",
+        benefit_text,
+    ):
+        label = normalize_space(m.group(0))
+        if label and label not in seen:
+            seen.add(label)
+            results.append(label)
+    # Format 2: "N만원 이상 [조건텍스트] 최대 M원/% 결제할인" (조건부)
+    for m in re.finditer(
+        r"\d+\s*(?:만|천)?\s*원\s*이상\s*(?:[^\d\n|]{0,20})?(?:최대\s*)?(?:\d+(?:,\d{3})*(?:\.\d+)?\s*(?:만|천)?\s*원?|\d+(?:\.\d+)?\s*%)\s*결제\s*할인",
+        benefit_text,
+    ):
+        label = normalize_space(m.group(0))
+        if label and label not in seen:
+            seen.add(label)
+            results.append(label)
+    return results
 
 
 def merge_pipe_values(*values: str) -> str:
@@ -229,6 +246,9 @@ def append_extraction_note(row: dict[str, str], note: str) -> None:
     row["final_price_extraction_note"] = merge_pipe_values(row.get("final_price_extraction_note", ""), note)
 
 
+_MIN_PURCHASE_CONDITION_RE = re.compile(r"\d+\s*(?:만|천)?\s*원\s*이상")
+
+
 def best_payment_benefit_discount(price: int, benefit_info: str) -> tuple[int, str]:
     if price <= 0 or not benefit_info:
         return 0, ""
@@ -236,6 +256,9 @@ def best_payment_benefit_discount(price: int, benefit_info: str) -> tuple[int, s
     best_discount = 0
     best_label = ""
     for label in extract_payment_benefit_labels(benefit_info):
+        # 최소 구매금액 조건부 할인은 final_price에 적용하지 않음
+        if _MIN_PURCHASE_CONDITION_RE.search(label):
+            continue
         discount = 0
         if m := re.search(r"(\d+(?:\.\d+)?)\s*%", label):
             discount = int(price * float(m.group(1)) / 100)
@@ -752,10 +775,10 @@ def apply_detail_info_to_row(row: dict[str, str], detail: dict[str, str], source
     if detail.get("final_price_krw"):
         row["final_price_krw"] = detail["final_price_krw"]
         append_extraction_note(row, f"{source}:{detail.get('final_price_extraction_note', '')}")
-    row["payment_benefit_info"] = merge_pipe_values(
-        row.get("payment_benefit_info", ""),
-        detail.get("payment_benefit_info", ""),
-    )
+    detail_benefit = detail.get("payment_benefit_info", "")
+    if detail_benefit:
+        # 상세 페이지 데이터로 교체 (조건 포함 전체 텍스트가 더 정확)
+        row["payment_benefit_info"] = detail_benefit
     apply_payment_benefit_to_row(row, source)
 
 
