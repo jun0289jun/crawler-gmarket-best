@@ -814,6 +814,8 @@ def fetch_static_detail_info(session: requests.Session, url: str, timeout_sec: i
         "Sec-Fetch-Site": "same-site",
     }
     response = session.get(url, headers=headers, timeout=timeout_sec, allow_redirects=True)
+    if response.status_code in [403, 429]:
+        raise BlockedByBotError(f"requests 상세 페이지가 HTTP {response.status_code} 차단 응답을 받았습니다.")
     response.raise_for_status()
     html = response.text
     soup = BeautifulSoup(html, "html.parser")
