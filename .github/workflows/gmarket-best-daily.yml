@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  crawl-and-email:
+  smoke-test:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -28,29 +28,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install virtual display
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-
-      - name: Resolve Chrome or Chromium executable
-        run: |
-          BROWSER_PATH="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)"
-          if [ -z "$BROWSER_PATH" ]; then
-            echo "System Chrome/Chromium was not found. Installing Playwright Chromium as fallback."
-            python -m playwright install --with-deps chromium
-          else
-            echo "BROWSER_EXECUTABLE_PATH=$BROWSER_PATH" >> "$GITHUB_ENV"
-            echo "Using browser: $BROWSER_PATH"
-          fi
-
-      - name: Crawl Gmarket Best (전 카테고리 47개)
-        run: |
-          if [ -n "${BROWSER_EXECUTABLE_PATH:-}" ]; then
-            xvfb-run -a python gmarket_best_crawler.py --max-items 200 --mode auto --headed --browser-executable-path "$BROWSER_EXECUTABLE_PATH"
-          else
-            python gmarket_best_crawler.py --max-items 200 --mode auto
-          fi
+      - name: Smoke test Gmarket crawler
+        run: python gmarket_best_crawler.py --max-categories 1 --max-items 5 --mode auto --skip-detail-pages
 
       - name: Upload ZIP artifact
         uses: actions/upload-artifact@v4
@@ -59,16 +38,3 @@ jobs:
           path: output/*.zip
           if-no-files-found: error
           retention-days: 14
-
-      - name: Send CSV by email
-        env:
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          SMTP_FROM: ${{ secrets.SMTP_FROM }}
-          SMTP_TO: ${{ secrets.SMTP_TO }}
-          SMTP_USE_TLS: ${{ secrets.SMTP_USE_TLS }}
-          SMTP_USE_SSL: ${{ secrets.SMTP_USE_SSL }}
-          EMAIL_SUBJECT: ${{ secrets.EMAIL_SUBJECT }}
-        run: python send_email.py

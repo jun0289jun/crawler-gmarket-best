@@ -87,7 +87,7 @@ BROWSER_LAUNCH_ARGS = [
     "--disable-features=IsolateOrigins,site-per-process",
     "--window-size=1440,1800",
 ]
-DETAIL_PAGE_DELAY_SEC = 0.5  # 상품 상세 페이지 간 요청 딜레이
+DETAIL_PAGE_DELAY_SEC = 3.0  # 상품 상세 페이지 간 요청 딜레이
 DETAIL_BOT_ERROR_LIMIT = 3
 
 RED_PRICE_RGB = "rgb(218, 18, 13)"  # #DA120D
@@ -293,10 +293,45 @@ def apply_payment_benefit_to_row(row: dict[str, str], source: str) -> None:
     append_extraction_note(row, f"{source}:payment_benefit:{label}:discount={discount}")
 
 
-def is_bot_page(html_or_text: str) -> bool:
+def bot_detection_keywords(html_or_text: str) -> list[str]:
     text = html_or_text or ""
-    return any(keyword in text for keyword in ["봇 확인", "간단한 확인 안내", "captcha", "cf-chl", "Cloudflare"])
+    return [keyword for keyword in ["봇 확인", "간단한 확인 안내", "captcha", "cf-chl", "Cloudflare"] if keyword in text]
 
+
+def is_bot_page(html_or_text: str) -> bool:
+    return bool(bot_detection_keywords(html_or_text))
+
+
+def write_bot_detection_log(
+    url: str,
+    method: str,
+    html_or_text: str,
+    status_code: int | None = None,
+    mode: str = "",
+    detail_pages: str = "",
+) -> Path:
+    log_dir = DEFAULT_OUT_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    log_path = log_dir / f"bot_detection_{timestamp}.log"
+    payload = {
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "url": url,
+        "method": method,
+        "status_code": status_code,
+        "mode": mode,
+        "detail_pages": detail_pages,
+        "keywords": bot_detection_keywords(html_or_text),
+        "snippet": normalize_space(html_or_text or "")[:300],
+    }
+    log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return log_path
+
+
+def detail_sleep_seconds(delay_sec: float) -> float:
+    if delay_sec <= 0:
+        return 0
+    return random.uniform(delay_sec, delay_sec * 1.8)
 
 def fallback_parse_text(card_text: str) -> dict[str, str]:
     data = {
@@ -444,13 +479,17 @@ def next_item_final_price(item: dict[str, Any]) -> tuple[str, str, str, str]:
 def fetch_static_html(url: str, timeout_sec: int) -> str:
     session = requests.Session()
     response = session.get(url, headers=REQUEST_HEADERS, timeout=timeout_sec, allow_redirects=True)
+    if response.status_code in [403, 429]:
+        log_path = write_bot_detection_log(url, "requests:list", response.text, response.status_code)
+        raise BlockedByBotError(f"requests list request blocked with HTTP {response.status_code}. log={log_path}")
     response.raise_for_status()
     html = response.text
     soup = BeautifulSoup(html, "html.parser")
     has_next_items = bool(extract_next_items(soup))
     has_dom_items = bool(soup.select("li.list-item"))
     if is_bot_page(html) and not (has_next_items or has_dom_items):
-        raise BlockedByBotError("requests 방식이 G마켓 봇 확인 페이지를 받았습니다.")
+        log_path = write_bot_detection_log(url, "requests:list", html, response.status_code)
+        raise BlockedByBotError(f"requests 방식이 G마켓 봇 확인 페이지를 받았습니다. log={log_path}")
     if not (has_next_items or has_dom_items):
         raise RuntimeError("requests 방식으로 상품 데이터가 포함된 HTML을 찾지 못했습니다.")
     return html
@@ -504,7 +543,6 @@ def fetch_rendered_html(
             )
         page = context.new_page()
         STEALTH.apply_stealth_sync(page)
-        page.add_init_script("window.close = function() {};")
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         try:
             page.wait_for_selector("li.list-item", timeout=timeout_ms)
@@ -513,9 +551,10 @@ def fetch_rendered_html(
 
         body_text = page.locator("body").inner_text(timeout=5000)
         if is_bot_page(body_text):
+            log_path = write_bot_detection_log(url, "browser:list", body_text)
             raise BlockedByBotError(
                 "G마켓이 현재 브라우저 실행 방식을 봇으로 판별했습니다. "
-                "GitHub Actions 서버 IP 자체가 차단될 수 있으므로 README의 대안을 확인하세요."
+                f"GitHub Actions 서버 IP 자체가 차단될 수 있으므로 README의 대안을 확인하세요. log={log_path}"
             )
 
         previous_count = -1
@@ -852,13 +891,15 @@ def fetch_static_detail_info(session: requests.Session, url: str, timeout_sec: i
     }
     response = session.get(url, headers=headers, timeout=timeout_sec, allow_redirects=True)
     if response.status_code in [403, 429]:
-        raise BlockedByBotError(f"requests 상세 페이지가 HTTP {response.status_code} 차단 응답을 받았습니다.")
+        log_path = write_bot_detection_log(url, "requests:detail", response.text, response.status_code)
+        raise BlockedByBotError(f"requests detail request blocked with HTTP {response.status_code}. log={log_path}")
     response.raise_for_status()
     html = response.text
     soup = BeautifulSoup(html, "html.parser")
     detail = extract_detail_page_info_from_soup(soup)
     if is_bot_page(html) and not detail_info_has_value(detail):
-        raise BlockedByBotError("requests 상세 페이지가 봇 확인 페이지를 받았습니다.")
+        log_path = write_bot_detection_log(url, "requests:detail", html, response.status_code)
+        raise BlockedByBotError(f"requests 상세 페이지가 봇 확인 페이지를 받았습니다. log={log_path}")
     if not detail_info_has_value(detail):
         raise RuntimeError("requests 상세 페이지에서 가격/결제할인 정보를 찾지 못했습니다.")
     return detail
@@ -918,11 +959,20 @@ def enrich_rows_with_detail_pages(
     browser_executable_path: str,
     delay_sec: float,
     stop_on_bot: bool,
+    max_detail_items: int = 0,
     user_data_dir: str = "",
     cdp_url: str = "",
-) -> None:
+) -> dict[str, int]:
+    stats = {"detail_attempted": 0, "detail_success": 0, "detail_bot_detected": 0, "detail_skipped_by_limit": 0}
     if not rows:
-        return
+        return stats
+
+    detail_rows = rows[:max_detail_items] if max_detail_items > 0 else rows
+    if max_detail_items > 0 and len(rows) > len(detail_rows):
+        stats["detail_skipped_by_limit"] = len(rows) - len(detail_rows)
+        for rest_row in rows[len(detail_rows):]:
+            apply_payment_benefit_to_row(rest_row, "list")
+            append_extraction_note(rest_row, "detail_skipped:max_detail_items")
 
     detail_session = requests.Session()
     playwright = None
@@ -975,7 +1025,6 @@ def enrich_rows_with_detail_pages(
             )
         page = context.new_page()
         STEALTH.apply_stealth_sync(page)
-        page.add_init_script("window.close = function() {};")
         page.goto(source_url, wait_until="domcontentloaded", timeout=timeout_ms)
         try:
             page.wait_for_selector("li.list-item", timeout=10000)
@@ -1004,7 +1053,7 @@ def enrich_rows_with_detail_pages(
         external_browser = False
 
     try:
-        for idx, row in enumerate(rows, start=1):
+        for idx, row in enumerate(detail_rows, start=1):
             product_url = row.get("product_url", "")
             if not product_url:
                 apply_payment_benefit_to_row(row, "list")
@@ -1013,20 +1062,23 @@ def enrich_rows_with_detail_pages(
                 try:
                     detail = fetch_static_detail_info(detail_session, product_url, request_timeout_sec)
                     apply_detail_info_to_row(row, detail, "detail_requests")
-                    print(f"    detail={idx}/{len(rows)} ok method=requests")
-                    if idx < len(rows) and delay_sec > 0:
-                        time.sleep(delay_sec)
+                    stats["detail_attempted"] += 1
+                    stats["detail_success"] += 1
+                    bot_error_count = 0
+                    print(f"    detail={idx}/{len(detail_rows)} ok method=requests")
+                    if idx < len(detail_rows) and delay_sec > 0:
+                        time.sleep(detail_sleep_seconds(delay_sec))
                     continue
                 except BlockedByBotError as static_block_exc:
                     if stop_on_bot:
                         raise
                     print(
-                        f"    detail={idx}/{len(rows)} requests_blocked "
+                        f"    detail={idx}/{len(detail_rows)} requests_blocked "
                         f"reason={type(static_block_exc).__name__}: {static_block_exc}"
                     )
                 except Exception as static_exc:
                     print(
-                        f"    detail={idx}/{len(rows)} requests_failed "
+                        f"    detail={idx}/{len(detail_rows)} requests_failed "
                         f"reason={type(static_exc).__name__}: {static_exc}"
                     )
 
@@ -1040,31 +1092,39 @@ def enrich_rows_with_detail_pages(
 
                 body_text = page.locator("body").inner_text(timeout=5000)
                 if is_bot_page(body_text):
-                    raise BlockedByBotError("상품 상세 페이지가 봇 확인 페이지를 반환했습니다.")
+                    log_path = write_bot_detection_log(product_url, "browser:detail", body_text)
+                    raise BlockedByBotError(f"상품 상세 페이지가 봇 확인 페이지를 반환했습니다. log={log_path}")
 
                 detail = extract_rendered_detail_page_info(page)
                 apply_detail_info_to_row(row, detail, "detail_browser")
-                print(f"    detail={idx}/{len(rows)} ok method=browser")
+                stats["detail_attempted"] += 1
+                stats["detail_success"] += 1
+                bot_error_count = 0
+                print(f"    detail={idx}/{len(detail_rows)} ok method=browser")
             except Exception as exc:
                 apply_payment_benefit_to_row(row, "list")
                 append_extraction_note(row, f"detail_failed:{type(exc).__name__}")
-                print(f"    detail={idx}/{len(rows)} failed reason={type(exc).__name__}: {exc}")
+                stats["detail_attempted"] += 1
+                print(f"    detail={idx}/{len(detail_rows)} failed reason={type(exc).__name__}: {exc}")
                 if "closed" in str(exc).lower():
                     reset_browser()
                 if isinstance(exc, BlockedByBotError):
                     bot_error_count += 1
+                    stats["detail_bot_detected"] += 1
                     if stop_on_bot and bot_error_count >= DETAIL_BOT_ERROR_LIMIT:
-                        remaining = len(rows) - idx
+                        remaining = len(detail_rows) - idx
                         print(
                             "    detail=disabled "
                             f"reason=bot_detected count={bot_error_count} remaining={remaining}"
                         )
-                        for rest_row in rows[idx:]:
+                        for rest_row in detail_rows[idx:]:
                             apply_payment_benefit_to_row(rest_row, "list")
                             append_extraction_note(rest_row, "detail_skipped:bot_detected")
                         break
-            if idx < len(rows) and delay_sec > 0:
-                time.sleep(delay_sec)
+                else:
+                    bot_error_count = 0
+            if idx < len(detail_rows) and delay_sec > 0:
+                time.sleep(detail_sleep_seconds(delay_sec))
     finally:
         if context is not None and not external_browser:
             context.close()
@@ -1072,7 +1132,7 @@ def enrich_rows_with_detail_pages(
             browser.close()
         if playwright is not None:
             playwright.stop()
-
+    return stats
 
 def zip_output_dir(dir_path: Path, zip_path: Path) -> None:
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1095,7 +1155,9 @@ def parse_args() -> argparse.Namespace:
         default="off",
         help="상품 상세 페이지 보강 방식: off=접속 안 함, auto=봇 감지 시 중단, force=끝까지 시도",
     )
-    parser.add_argument("--detail-delay-sec", type=float, default=DETAIL_PAGE_DELAY_SEC, help="상품 상세 페이지 간 딜레이(초)")
+    parser.add_argument("--detail-delay-sec", type=float, default=DETAIL_PAGE_DELAY_SEC, help="상품 상세 페이지 간 기본 딜레이(초). 실제 대기는 jitter가 적용됩니다")
+    parser.add_argument("--max-detail-items", type=int, default=0, help="상세 페이지 보강 최대 상품 수. 0이면 전체 rows를 대상으로 합니다")
+    parser.add_argument("--max-categories", type=int, default=0, help="처리할 최대 카테고리 수. 0이면 전체 카테고리를 처리합니다")
     parser.add_argument("--skip-detail-pages", action="store_true", help="상품 상세 페이지 열람 및 결제할인 보강을 건너뜁니다")
     parser.add_argument(
         "--browser-executable-path",
@@ -1125,8 +1187,12 @@ def main() -> None:
     summary: list[dict[str, str]] = []
     failed_categories: list[str] = []
 
-    total = len(CATEGORIES)
-    for idx, (cat_main, cat_sub, group_code, sub_group_code) in enumerate(CATEGORIES, start=1):
+    categories = CATEGORIES[:args.max_categories] if args.max_categories > 0 else CATEGORIES
+    total = len(categories)
+    report = {"detail_attempted": 0, "detail_success": 0, "detail_bot_detected": 0, "detail_skipped_by_limit": 0}
+    if combined_path.exists():
+        combined_path.unlink()
+    for idx, (cat_main, cat_sub, group_code, sub_group_code) in enumerate(categories, start=1):
         url = f"{BEST_URL}?groupCode={group_code}&subGroupCode={sub_group_code}"
         safe_name = cat_sub.replace("/", "_")
         cat_csv = out_dir / f"{cat_main}_{safe_name}.csv"
@@ -1159,7 +1225,7 @@ def main() -> None:
                 for row in rows:
                     apply_payment_benefit_to_row(row, "list")
             else:
-                enrich_rows_with_detail_pages(
+                detail_stats = enrich_rows_with_detail_pages(
                     rows,
                     url,
                     args.timeout_ms,
@@ -1168,9 +1234,12 @@ def main() -> None:
                     args.browser_executable_path,
                     args.detail_delay_sec,
                     stop_on_bot=args.detail_pages == "auto",
+                    max_detail_items=args.max_detail_items,
                     user_data_dir=args.user_data_dir,
                     cdp_url=args.cdp_url,
                 )
+                for key, value in detail_stats.items():
+                    report[key] += value
 
             # 카테고리별 개별 CSV
             write_csv(rows, cat_csv)
@@ -1193,6 +1262,12 @@ def main() -> None:
     print("\n" + "=" * 60)
     print(f"완료: {total - len(failed_categories)}/{total} 카테고리 성공")
     print(f"합본 CSV: {combined_path}")
+    print("상세 페이지 보고서:")
+    print(
+        f"  attempted={report['detail_attempted']} success={report['detail_success']} "
+        f"bot_detected={report['detail_bot_detected']} skipped_by_limit={report['detail_skipped_by_limit']}"
+    )
+    print(f"진단 로그 디렉터리: {DEFAULT_OUT_DIR / 'logs'}")
     if failed_categories:
         print(f"실패 카테고리 ({len(failed_categories)}개):")
         for cat in failed_categories:
