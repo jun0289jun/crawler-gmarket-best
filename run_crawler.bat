@@ -19,19 +19,8 @@ if not "%EXIT_CODE%"=="0" (
 )
 
 echo.
-echo Crawl completed. Sending email...
-python send_email.py >> "%RUN_LOG%" 2>&1
-set EXIT_CODE=%errorlevel%
-type "%RUN_LOG%"
-if not "%EXIT_CODE%"=="0" (
-    echo.
-    echo Email failed. Check %RUN_LOG%.
-    pause
-    exit /b %EXIT_CODE%
-)
-
-echo.
-echo Production run completed.
+echo Production crawl completed.
+echo CSV and ZIP files were created under output.
 echo Log saved to %RUN_LOG%.
 pause
 
