@@ -260,7 +260,11 @@ def append_extraction_note(row: dict[str, str], note: str) -> None:
 _MIN_PURCHASE_CONDITION_RE = re.compile(r"\d+\s*(?:만|천)?\s*원\s*이상")
 
 
-def best_payment_benefit_discount(price: int, benefit_info: str) -> tuple[int, str]:
+def best_payment_benefit_discount(
+    price: int,
+    benefit_info: str,
+    allow_fixed_amount_discount: bool = True,
+) -> tuple[int, str]:
     if price <= 0 or not benefit_info:
         return 0, ""
 
@@ -274,6 +278,8 @@ def best_payment_benefit_discount(price: int, benefit_info: str) -> tuple[int, s
         if m := re.search(r"(\d+(?:\.\d+)?)\s*%", label):
             discount = int(price * float(m.group(1)) / 100)
         else:
+            if not allow_fixed_amount_discount:
+                continue
             discount = money_amount_from_text(label)
         discount = max(0, min(discount, price))
         if discount > best_discount:
@@ -286,7 +292,14 @@ def apply_payment_benefit_to_row(row: dict[str, str], source: str) -> None:
     base_price = parse_price_int(
         row.get("final_price_krw") or row.get("coupon_applied_price_krw") or row.get("sale_price_krw")
     )
-    discount, label = best_payment_benefit_discount(base_price, row.get("payment_benefit_info", ""))
+    # 목록 페이지의 "결제할인 1만원" 표기는 상세 조건(예: 30만원 이상)을 숨기는 경우가 있어
+    # 상세 페이지에서 확인되지 않은 정액 할인은 final_price에 적용하지 않는다.
+    allow_fixed_amount_discount = not source.startswith("list")
+    discount, label = best_payment_benefit_discount(
+        base_price,
+        row.get("payment_benefit_info", ""),
+        allow_fixed_amount_discount=allow_fixed_amount_discount,
+    )
     if not discount:
         return
     row["final_price_krw"] = str(max(base_price - discount, 0))
