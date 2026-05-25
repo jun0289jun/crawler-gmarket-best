@@ -8,7 +8,7 @@ set RUN_LOG=output\logs\run_crawler_last.log
 git pull
 
 echo Running production crawl...
-python gmarket_best_crawler.py --max-items 200 --mode auto --detail-pages auto --max-detail-items 20 --detail-delay-sec 3 > "%RUN_LOG%" 2>&1
+python gmarket_best_crawler.py --max-items 200 --mode auto --detail-pages auto --max-detail-items 20 --detail-delay-sec 3 --cdp-url http://localhost:9222 > "%RUN_LOG%" 2>&1
 set EXIT_CODE=%errorlevel%
 type "%RUN_LOG%"
 if not "%EXIT_CODE%"=="0" (
