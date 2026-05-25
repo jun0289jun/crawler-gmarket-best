@@ -520,15 +520,19 @@ def fetch_rendered_html(
     with sync_playwright() as p:
         external_browser = False
         if cdp_url:
-            browser = p.chromium.connect_over_cdp(cdp_url)
-            context = browser.contexts[0] if browser.contexts else browser.new_context(
-                locale="ko-KR",
-                timezone_id="Asia/Seoul",
-                viewport={"width": 1440, "height": 1800},
-                extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"},
-            )
-            external_browser = True
-        elif user_data_dir:
+            try:
+                browser = p.chromium.connect_over_cdp(cdp_url)
+                context = browser.contexts[0] if browser.contexts else browser.new_context(
+                    locale="ko-KR",
+                    timezone_id="Asia/Seoul",
+                    viewport={"width": 1440, "height": 1800},
+                    extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"},
+                )
+                external_browser = True
+            except Exception as cdp_exc:
+                print(f"  cdp_connect_failed={cdp_exc!r}, falling back to browser launch")
+                cdp_url = ""
+        if not cdp_url and user_data_dir:
             persistent_opts: dict[str, Any] = {
                 "headless": headless,
                 "args": BROWSER_LAUNCH_ARGS,
@@ -541,7 +545,7 @@ def fetch_rendered_html(
                 persistent_opts["executable_path"] = browser_executable_path
             browser = None
             context = p.chromium.launch_persistent_context(user_data_dir, **persistent_opts)
-        else:
+        elif not cdp_url:
             launch_options: dict[str, Any] = {"headless": headless, "args": BROWSER_LAUNCH_ARGS}
             if browser_executable_path:
                 launch_options["executable_path"] = browser_executable_path
@@ -1001,16 +1005,20 @@ def enrich_rows_with_detail_pages(
             return page
         playwright = sync_playwright().start()
         if cdp_url:
-            cdp_browser = playwright.chromium.connect_over_cdp(cdp_url)
-            context = cdp_browser.contexts[0] if cdp_browser.contexts else cdp_browser.new_context(
-                locale="ko-KR",
-                timezone_id="Asia/Seoul",
-                viewport={"width": 1440, "height": 1800},
-                extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"},
-            )
-            external_browser = True
-            browser = None
-        elif user_data_dir:
+            try:
+                cdp_browser = playwright.chromium.connect_over_cdp(cdp_url)
+                context = cdp_browser.contexts[0] if cdp_browser.contexts else cdp_browser.new_context(
+                    locale="ko-KR",
+                    timezone_id="Asia/Seoul",
+                    viewport={"width": 1440, "height": 1800},
+                    extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"},
+                )
+                external_browser = True
+                browser = None
+            except Exception as cdp_exc:
+                print(f"  cdp_connect_failed={cdp_exc!r}, falling back to browser launch")
+                cdp_url = ""
+        if not cdp_url and user_data_dir:
             persistent_opts: dict[str, Any] = {
                 "headless": not headed,
                 "args": BROWSER_LAUNCH_ARGS,
@@ -1023,7 +1031,7 @@ def enrich_rows_with_detail_pages(
                 persistent_opts["executable_path"] = browser_executable_path
             browser = None
             context = playwright.chromium.launch_persistent_context(user_data_dir, **persistent_opts)
-        else:
+        elif not cdp_url:
             launch_options: dict[str, Any] = {"headless": not headed, "args": BROWSER_LAUNCH_ARGS}
             if browser_executable_path:
                 launch_options["executable_path"] = browser_executable_path
